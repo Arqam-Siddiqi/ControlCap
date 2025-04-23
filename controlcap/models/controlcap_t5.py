@@ -307,7 +307,7 @@ class ControlCapT5(Blip2T5):
             control_embeds, control_tokens = self.cem_forward(control_words, visual_embeds)
             visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
 
-        with self.maybe_autocast(dtype=torch.float16):
+        with self.maybe_autocast(dtype=torch.bfloat16):
             object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(
                 image.device
             )
@@ -364,7 +364,7 @@ class ControlCapT5(Blip2T5):
             control_embeds, control_tokens = self.cem_forward(control_words, visual_embeds)
             visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
 
-        with self.maybe_autocast(dtype=torch.float16):
+        with self.maybe_autocast(dtype=torch.bfloat16):
             object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(
                 image.device
             )
@@ -429,8 +429,4 @@ class ControlCapT5(Blip2T5):
         if cfg.pretrained is not None:
             model.load_checkpoint(url_or_filename=cfg.pretrained)
         return model
-
-
-
-
 
