@@ -184,9 +184,13 @@ class ControlCapTask(BaseTask):
             builder = registry.get_builder_class("controlcap")(dataset_config)
             dataset = builder.build_datasets()
 
-            if not name == eval_dataset_name:
+            if name != eval_dataset_name:
                 dataset.pop("val", None)
                 dataset.pop("test", None)
+                
+            # NEW: if only evaluating, drop the train split even for the eval dataset
+            if self.evaluate:
+                dataset.pop("train", None)
 
             datasets[name] = dataset
 

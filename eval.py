@@ -1,3 +1,5 @@
+# Not actually used for evaluation. train.py is used for both training and evaluation.
+
 import argparse
 import os.path
 import random
