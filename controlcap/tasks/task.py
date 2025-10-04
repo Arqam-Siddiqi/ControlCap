@@ -181,6 +181,19 @@ class ControlCapTask(BaseTask):
         for name in datasets_config:
             dataset_config = datasets_config[name]
 
+            # NEW: Block to prevent building train
+            if self.evaluate and (
+                (self.eval_dataset_name is None and name == list(datasets_config)[0])
+                or (self.eval_dataset_name is not None and name == self.eval_dataset_name)
+            ):
+                import copy
+                dataset_config = copy.deepcopy(dataset_config)
+                anns = dataset_config.build_info.annotations
+                if "train" in anns:
+                    anns.pop("train")  # prevents building train split
+                # (optional) also drop test if not needed:
+                # if "test" in anns: anns.pop("test")
+
             builder = registry.get_builder_class("controlcap")(dataset_config)
             dataset = builder.build_datasets()
 

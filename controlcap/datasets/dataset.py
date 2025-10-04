@@ -173,9 +173,15 @@ class ControlCapDataset(BaseDataset):
                 "caps": language_data["caps"],
                 "tags": language_data["tags"],
                 "ids": [obj["id"] for obj in objs]}
-        except:
-            print(f"find an invalid sample [{str(ann)}]")
-            return self.__getitem__(index + 1)
+        except Exception as e:
+            # NEW: Showing traceback
+            import traceback
+            # safer access if ann failed before assignment
+            ann_id = ann.get("id", "?") if 'ann' in locals() else '?'
+            img_file = ann.get("file_name", "?") if 'ann' in locals() else '?'
+            print(f"[ERROR] sample load failed idx={index} ann_id={ann_id} file={img_file}: {e}")
+            traceback.print_exc()
+            raise e
 
     def collater(self, samples):
         image_list = []
