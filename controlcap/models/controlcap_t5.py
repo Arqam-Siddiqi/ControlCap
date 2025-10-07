@@ -52,18 +52,6 @@ class CrossAttnBlock(nn.Module):
 
 @registry.register_model("controlcap_t5")
 class ControlCapT5(Blip2T5):
-
-    # (ADDED) internal helper with CUDA + device safeguard
-    def _log_mem(self, tag):
-        if not self.mem_log or not torch.cuda.is_available():
-            return
-        dev = "cuda"
-        
-        alloc = torch.cuda.memory_allocated(dev) / 1024**3
-        reserv = torch.cuda.memory_reserved(dev) / 1024**3
-        peak = torch.cuda.max_memory_allocated(dev) / 1024**3
-        print(f"[MEM][{tag}] alloc={alloc:.2f}GB reserved={reserv:.2f}GB peak={peak:.2f}GB")
-
     def __init__(self, *args, **kwargs):
         self.kwargs = kwargs
         # (ADDED) flag: enable memory logging via kwarg or env var
@@ -72,7 +60,18 @@ class ControlCapT5(Blip2T5):
         load_in_4bit = kwargs.get("load_in_4bit", False)
         device_map = kwargs.get("device_map", "auto")
         hf_cache_dir = kwargs.get("hf_cache_dir", None)
+        # (ADDED) internal helper with CUDA + device safeguard
+        def _log_mem(tag):
+            if not self.mem_log or not torch.cuda.is_available():
+                return
+            dev = "cuda"
+            
+            alloc = torch.cuda.memory_allocated(dev) / 1024**3
+            reserv = torch.cuda.memory_reserved(dev) / 1024**3
+            peak = torch.cuda.max_memory_allocated(dev) / 1024**3
+            print(f"[MEM][{tag}] alloc={alloc:.2f}GB reserved={reserv:.2f}GB peak={peak:.2f}GB")
         
+        self._log_mem = _log_mem
         base_kwargs = copy.deepcopy(kwargs)
         base_keys = ["vit_model","img_size","drop_path_rate","use_grad_checkpoint",
                      "vit_precision","freeze_vit","num_query_token","t5_model",
@@ -85,7 +84,7 @@ class ControlCapT5(Blip2T5):
         super().__init__(*args, **base_kwargs)
         if self.mem_log and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        self._log_mem("after_super_init")
+        _log_mem("after_super_init")
 
         # ===== Replace full-precision T5 with quantized variant if requested =====
         if load_in_8bit or load_in_4bit:
@@ -100,16 +99,16 @@ class ControlCapT5(Blip2T5):
             del self.t5_model
             gc.collect()
             torch.cuda.empty_cache()
-            self._log_mem("after_delete_full_t5_before_quant_reload")
+            _log_mem("after_delete_full_t5_before_quant_reload")
             self.t5_model = AutoModelForSeq2SeqLM.from_pretrained(
                 model_id,
                 quantization_config=bnb_cfg,
                 device_map=device_map,
                 cache_dir=hf_cache_dir,
             )
-            self._log_mem("after_quant_t5_reload")
+            _log_mem("after_quant_t5_reload")
         else:
-            self._log_mem("full_model_is_used_(no_quantization)")
+            _log_mem("full_model_is_used_(no_quantization)")
 
 
         # ===== Existing ControlCap custom modules (unchanged preamble) =====
@@ -188,7 +187,7 @@ class ControlCapT5(Blip2T5):
         print(f"[ trainable ratio : {trainable_params / all_params}]")
         for idx, name in enumerate(names):
             print(f"[{name} ratio : {params[idx] / all_params}]")
-        self._log_mem("after_param_freeze_selection")
+        _log_mem("after_param_freeze_selection")
 
     def roi_align(self, image_embeds, samples):
         # prepare cls image embeds and spatio image embeddings
@@ -361,22 +360,22 @@ class ControlCapT5(Blip2T5):
         with self.maybe_autocast(dtype=torch.float16):
             embeds = self.ln_vision(self.visual_encoder(image))
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("forward:after_vision alloc")
+                print(f"[MEM] forward:after_vision alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             visual_embeds, visual_tag_embeds = self.cvem_forward(samples, embeds)
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("forward:after_cvem alloc")
+                print(f"[MEM] forward:after_cvem alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             tag_logits = self.tag_forward(samples, visual_tag_embeds)
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("forward:after_tag_forward alloc")
+                print(f"[MEM] forward:after_tag_forward alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             control_words = self.prepare_control_words(samples, tag_logits)
             control_embeds, control_tokens = self.cem_forward(control_words, visual_embeds)
             visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("forward:after_ebm alloc")
+                print(f"[MEM] forward:after_ebm alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
         with self.maybe_autocast(dtype=torch.bfloat16):
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("forward:before_t5 alloc")
+                print(f"[MEM] forward:before_t5 alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(
                 image.device
             )
@@ -434,22 +433,22 @@ class ControlCapT5(Blip2T5):
         with self.maybe_autocast(dtype=torch.float16):
             embeds = self.ln_vision(self.visual_encoder(image))
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("predict:after_vision alloc")
+                print(f"[MEM] predict:after_vision alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             visual_embeds, visual_tag_embeds = self.cvem_forward(samples, embeds)
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("predict:after_cvem alloc")
+                print(f"[MEM] predict:after_cvem alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             tag_logits = self.tag_forward(samples, visual_tag_embeds)
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("predict:after_tag_forward alloc")
+                print(f"[MEM] predict:after_tag_forward alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             control_words, stags, otags = self.prepare_control_words(samples, tag_logits)
             control_embeds, control_tokens = self.cem_forward(control_words, visual_embeds)
             visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("predict:after_ebm alloc")
+                print(f"[MEM] predict:after_ebm alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
         with self.maybe_autocast(dtype=torch.bfloat16):
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("predict:before_qformer alloc")
+                print(f"[MEM] predict:before_qformer alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(
                 image.device
             )
@@ -465,7 +464,7 @@ class ControlCapT5(Blip2T5):
             encoder_atts = torch.cat([atts_t5, control_tokens.attention_mask], dim=1)
             inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
             if self.mem_log and torch.cuda.is_available():
-                self._log_mem("predict:before_generate alloc")
+                print(f"[MEM] predict:before_generate alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
             llm_kwargs = {
                 "do_sample": False,

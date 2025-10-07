@@ -25,21 +25,18 @@ def parse_args():
 
     parser.add_argument("--cfg-path", required=True, help="path to configuration file.")
     parser.add_argument("--res-path", required=True, help="path to the dense caption result")
+    parser.add_argument("--gt-path", default=None, help="(Optional) custom ground-truth JSON for subset evaluation")
     parser.add_argument("--metric", action="store_true", help="evaluate meteor score")
     parser.add_argument("--visualize", action="store_true", help="visualize result")
-    parser.add_argument("--local-rank", default=-1, type=int)  # for debug
+    parser.add_argument("--local-rank", default=-1, type=int)
     parser.add_argument(
         "--options",
         nargs="+",
         help="override some settings in the used config, the key-value pair "
-        "in xxx=yyy format will be merged into config file (deprecate), "
-        "change to --cfg-options instead.",
+             "in xxx=yyy format will be merged into config file (deprecate), "
+             "change to --cfg-options instead.",
     )
-
     args = parser.parse_args()
-    # if 'LOCAL_RANK' not in os.environ:
-    #     os.environ['LOCAL_RANK'] = str(args.local_rank)
-
     return args
 
 
@@ -70,7 +67,8 @@ def main():
         if ("reg" in task.eval_dataset_name) or ("refcoco" in task.eval_dataset_name):
             task.report_metrics_reg(res_path)
         else:
-            task.report_metrics_densecap(res_path)
+            # pass override gt path (new argument)
+            task.report_metrics_densecap(res_path, gt_file_override=cfg.args.gt_path)
 
     if cfg.args.visualize:
         task.visualize_result(res_path)
