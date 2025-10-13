@@ -5,6 +5,7 @@ from functools import partial
 from transformers import AutoModelForSeq2SeqLM, BitsAndBytesConfig
 import gc
 import os  # (ADDED) for env flag
+from contextlib import nullcontext  # (ADDED)
 
 import numpy as np
 import torch
@@ -56,6 +57,8 @@ class ControlCapT5(Blip2T5):
         self.kwargs = kwargs
         # (ADDED) flag: enable memory logging via kwarg or env var
         self.mem_log = kwargs.get("mem_log", False) or os.environ.get("RUN_MEM_LOG", "0") == "1"
+        # NEW: AMP mode for LLM path: one of {"auto","bf16","fp16","fp32"}
+        self.llm_amp_mode = kwargs.get("llm_amp_mode", "auto")
         load_in_8bit = kwargs.get("load_in_8bit", False)
         load_in_4bit = kwargs.get("load_in_4bit", False)
         device_map = kwargs.get("device_map", "auto")
@@ -155,8 +158,8 @@ class ControlCapT5(Blip2T5):
         self.num_tags = len(self.tag_list)
         self.tag_labels = nn.Embedding(self.num_tags * 2, tag_bert_config.hidden_size)
         self.tag_fc = nn.Linear(tag_bert_config.hidden_size, 1)
-        self.tag_weight = 0.005
-        self.tag_loss_function = AsymmetricLoss(gamma_neg=7, gamma_pos=0, clip=0.05)
+        # NEW: micro-batch size for tag head (can override with env TAG_CHUNK_SIZE)
+        self.tag_chunk_size = int(kwargs.get("tag_chunk_size", int(os.environ.get("TAG_CHUNK_SIZE", 16))))
 
         # Trainable parameters
         names = ["cvem", "cem", "tag", "ebm", "Qformer", "t5_proj"]
@@ -221,20 +224,50 @@ class ControlCapT5(Blip2T5):
         return visual_embeds, visual_tag_embeds
 
     def tag_forward(self, samples, tag_embeds):
-        bs = len(tag_embeds)
-        object_atts = torch.ones(tag_embeds.size()[:-1], dtype=torch.long).to(
-            tag_embeds.device
-        )
-        label_embed = self.tag_labels.weight.unsqueeze(0).repeat(bs, 1, 1)
+        # BEFORE:
+        # bs = len(tag_embeds)
+        # object_atts = torch.ones(tag_embeds.size()[:-1], dtype=torch.long).to(
+        #     tag_embeds.device
+        # )
+        # label_embed = self.tag_labels.weight.unsqueeze(0).repeat(bs, 1, 1)
+        # tagging_embed = self.tag_head(
+        #     encoder_embeds=label_embed,
+        #     encoder_hidden_states=tag_embeds,
+        #     encoder_attention_mask=object_atts,
+        #     return_dict=False,
+        #     mode='tagging',
+        # )
+        # tag_logits = self.tag_fc(tagging_embed[0]).squeeze(-1)
+        # return tag_logits
 
-        tagging_embed = self.tag_head(
-            encoder_embeds=label_embed,
-            encoder_hidden_states=tag_embeds,
-            encoder_attention_mask=object_atts,
-            return_dict=False,
-            mode='tagging',
-        )
-        tag_logits = self.tag_fc(tagging_embed[0]).squeeze(-1)
+        # NEW: micro-batch inference for tag head
+        bs = tag_embeds.shape[0]
+        device = tag_embeds.device
+        object_atts_full = torch.ones(tag_embeds.size()[:-1], dtype=torch.long, device=device)
+
+        chunk = max(1, int(getattr(self, "tag_chunk_size", 16)))
+        if self.mem_log and torch.cuda.is_available():
+            print(f"[MEM] tag_forward: bs={bs} chunk={chunk} alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
+        logits_chunks = []
+        for st in range(0, bs, chunk):
+            ed = min(st + chunk, bs)
+            te = tag_embeds[st:ed]
+            oa = object_atts_full[st:ed]
+            # repeat label embeddings only for the current micro-batch
+            label_embed = self.tag_labels.weight.unsqueeze(0).expand(ed - st, -1, -1).to(device)
+
+            tagging_embed = self.tag_head(
+                encoder_embeds=label_embed,
+                encoder_hidden_states=te,
+                encoder_attention_mask=oa,
+                return_dict=False,
+                mode='tagging',
+            )
+            logits = self.tag_fc(tagging_embed[0]).squeeze(-1)
+            logits_chunks.append(logits)
+
+        tag_logits = torch.cat(logits_chunks, dim=0)
         return tag_logits
 
     def prepare_control_words(self, samples, tag_logits):
@@ -358,6 +391,7 @@ class ControlCapT5(Blip2T5):
         image = torch.cat([samples["image"], samples["region_images"]], 0)
 
         with self.maybe_autocast(dtype=torch.float16):
+            # vision + CVEM + tagger
             embeds = self.ln_vision(self.visual_encoder(image))
             if self.mem_log and torch.cuda.is_available():
                 print(f"[MEM] forward:after_vision alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
@@ -373,12 +407,15 @@ class ControlCapT5(Blip2T5):
             if self.mem_log and torch.cuda.is_available():
                 print(f"[MEM] forward:after_ebm alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
-        with self.maybe_autocast(dtype=torch.bfloat16):
+        # LLM path (Q-Former + T5): avoid bf16 on unsupported GPUs, prefer fp32 for stability
+        with self._llm_autocast():
             if self.mem_log and torch.cuda.is_available():
                 print(f"[MEM] forward:before_t5 alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
-            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(
-                image.device
-            )
+           # Align encoder_hidden_states dtype with Q-Former weights to avoid Half/Float matmul
+            q_dtype = next(self.Qformer.parameters()).dtype
+            visual_embeds = visual_embeds.to(dtype=q_dtype)
+
+            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(image.device)
             query_tokens = self.query_tokens.expand(visual_embeds.shape[0], -1, -1)
             query_output = self.Qformer.bert(
                 query_embeds=query_tokens,
@@ -390,6 +427,11 @@ class ControlCapT5(Blip2T5):
             atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
             encoder_atts = torch.cat([atts_t5, control_tokens.attention_mask], dim=1)
             inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
+
+            # If running fp32 LLM mode on GPUs without bf16, keep embeds in fp32 to prevent NaNs
+            if (getattr(self, "llm_amp_mode", "auto") in ("fp32", "auto")) and (not torch.cuda.is_bf16_supported()):
+                inputs_embeds = inputs_embeds.float()
+                # control_tokens.attention_mask stays integer; control_embeds already merged
 
             tags = samples["tags"].to(torch.long)
             loss_tag = self.tag_loss_function(tag_logits, tags) * self.tag_weight
@@ -403,7 +445,8 @@ class ControlCapT5(Blip2T5):
             ).to(inputs_embeds.device)
 
             targets = output_tokens.input_ids.masked_fill(
-                output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100)
+                output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100
+            )
 
             outputs = self.t5_model(
                 inputs_embeds=inputs_embeds,
@@ -419,6 +462,18 @@ class ControlCapT5(Blip2T5):
 
             return {"loss": loss_llm + loss_tag, "loss_llm": loss_llm.detach(), "loss_tag": loss_tag.detach()}
 
+    def _llm_autocast(self):
+        mode = getattr(self, "llm_amp_mode", "auto")
+        # On P100, bf16 is not supported; auto => fp32
+        if mode == "auto":
+            mode = "bf16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "fp32"
+        if mode == "bf16":
+            return torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        if mode == "fp16":
+            return torch.cuda.amp.autocast(dtype=torch.float16)
+        # fp32 or unknown -> no autocast
+        return nullcontext()
+
     def predict_answers(
             self,
             samples,
@@ -431,6 +486,7 @@ class ControlCapT5(Blip2T5):
         image = torch.cat([samples["image"], samples["region_images"]], 0)
 
         with self.maybe_autocast(dtype=torch.float16):
+            # vision + CVEM + tagger
             embeds = self.ln_vision(self.visual_encoder(image))
             if self.mem_log and torch.cuda.is_available():
                 print(f"[MEM] predict:after_vision alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
@@ -446,12 +502,14 @@ class ControlCapT5(Blip2T5):
             if self.mem_log and torch.cuda.is_available():
                 print(f"[MEM] predict:after_ebm alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
-        with self.maybe_autocast(dtype=torch.bfloat16):
+        with self._llm_autocast():
             if self.mem_log and torch.cuda.is_available():
                 print(f"[MEM] predict:before_qformer alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
-            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(
-                image.device
-            )
+           # Align encoder_hidden_states dtype with Q-Former weights
+            q_dtype = next(self.Qformer.parameters()).dtype
+            visual_embeds = visual_embeds.to(dtype=q_dtype)
+
+            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(image.device)
             query_tokens = self.query_tokens.expand(visual_embeds.shape[0], -1, -1)
             query_output = self.Qformer.bert(
                 query_embeds=query_tokens,
@@ -463,6 +521,10 @@ class ControlCapT5(Blip2T5):
             atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
             encoder_atts = torch.cat([atts_t5, control_tokens.attention_mask], dim=1)
             inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
+
+            if (getattr(self, "llm_amp_mode", "auto") in ("fp32", "auto")) and (not torch.cuda.is_bf16_supported()):
+                inputs_embeds = inputs_embeds.float()
+
             if self.mem_log and torch.cuda.is_available():
                 print(f"[MEM] predict:before_generate alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
@@ -485,7 +547,7 @@ class ControlCapT5(Blip2T5):
                 attention_mask=encoder_atts,
                 output_scores=True,
                 return_dict_in_generate=True,
-                **llm_kwargs
+                **llm_kwargs,
             )
             if self.mem_log and torch.cuda.is_available():
                 peak = torch.cuda.max_memory_allocated()/1024**3
@@ -506,6 +568,7 @@ class ControlCapT5(Blip2T5):
 
         output = []
         for id, caption, score, stag, otag in zip(samples["ids"], captions, scores, stags, otags):
+            print(f"ControlCapT5: id={id} score={score:.4f} caption={caption}")
             output.append(
                 {"id": id, "caption": caption, "score": score, "tag_set1": stag, "tag_set2": otag}
             )

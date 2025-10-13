@@ -66,7 +66,7 @@ class Meteor:
             stderr_out = self.meteor_p.stderr.read().decode('utf-8', errors='ignore')
             raise RuntimeError(
                 f"[METEOR] Process exited immediately (code={self.meteor_p.returncode}). "
-                f"stderr:\\n{stderr_out}"
+                f"stderr:\n{stderr_out}"
             )
 
         atexit.register(self.close)
@@ -77,7 +77,7 @@ class Meteor:
                 try:
                     if self.meteor_p.stdin:
                         try:
-                            self.meteor_p.stdin.write(enc('QUIT\\n'))
+                            self.meteor_p.stdin.write(enc('QUIT\n'))
                             self.meteor_p.stdin.flush()
                         except Exception:
                             pass
@@ -105,7 +105,7 @@ class Meteor:
                 eval_line += ' ||| {}'.format(stat)
 
             try:
-                self._safe_write(eval_line + '\\n')
+                self._safe_write(eval_line + '\n')
             except BrokenPipeError as e:
                 self._raise_with_stderr("Broken pipe during EVAL write", e)
 
@@ -116,7 +116,7 @@ class Meteor:
                 try:
                     scores.append(float(dec(v.strip())))
                 except Exception:
-                    sys.stderr.write(f"[METEOR] Bad score line: {v}\\n")
+                    sys.stderr.write(f"[METEOR] Bad score line: {v}\n")
                     self._raise_with_stderr("Failed parsing score line.")
 
             final_line = self.meteor_p.stdout.readline()
@@ -142,8 +142,8 @@ class Meteor:
         except Exception:
             stderr_out = ""
         full = (
-            f"[METEOR ERROR] {msg}. returncode={rc}\\n"
-            f"--- STDERR ---\\n{stderr_out}\\n---------------"
+            f"[METEOR ERROR] {msg}. returncode={rc}\n"
+            f"--- STDERR ---\n{stderr_out}\n---------------"
         )
         if original_exc:
             raise RuntimeError(full) from original_exc
@@ -160,7 +160,7 @@ class Meteor:
         score_line = ' ||| '.join(('SCORE', ' ||| '.join(reference_list), hypothesis_str))
         score_line = re.sub(r'\\s+', ' ', score_line)
         try:
-            self._safe_write(f"{score_line}\\n")
+            self._safe_write(f"{score_line}\n")
         except BrokenPipeError as e:
             self._raise_with_stderr("Broken pipe during SCORE write", e)
         out = self.meteor_p.stdout.readline()
