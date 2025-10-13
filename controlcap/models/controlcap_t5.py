@@ -6,6 +6,8 @@ from transformers import AutoModelForSeq2SeqLM, BitsAndBytesConfig
 import gc
 import os  # (ADDED) for env flag
 from contextlib import nullcontext  # (ADDED)
+import torch.distributed as dist
+
 
 import numpy as np
 import torch
@@ -91,6 +93,17 @@ class ControlCapT5(Blip2T5):
 
         # ===== Replace full-precision T5 with quantized variant if requested =====
         if load_in_8bit or load_in_4bit:
+            # In DDP, avoid sharding across multiple GPUs inside a single process.
+            # Pin the T5 to the local rank device instead of device_map="auto".
+            ddp_active = dist.is_available() and dist.is_initialized()
+            if ddp_active:
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                torch.cuda.set_device(local_rank)
+                if device_map in (None, "auto", "balanced", "balanced_low_0"):
+                    device_map = {"": f"cuda:{local_rank}"}
+                    if self.mem_log:
+                        print(f"[INFO] Overriding device_map for DDP. Using single-device map: {device_map}")
+            
             model_id = base_kwargs["t5_model"]
             bnb_cfg = BitsAndBytesConfig(
                 load_in_8bit=load_in_8bit,
@@ -371,8 +384,11 @@ class ControlCapT5(Blip2T5):
             truncation=True,
             max_length=self.max_txt_len,
             return_tensors="pt",
-        ).to(embeds.device)
-        control_embeds = self.t5_model.encoder.embed_tokens(control_tokens.input_ids) + self.cem_memory
+        )
+        # Compute embeddings on the same device as the sharded embedding table (works with device_map="auto")
+        emb_dev = self.t5_model.encoder.embed_tokens.weight.device
+        control_embeds = self.t5_model.encoder.embed_tokens(control_tokens.input_ids.to(emb_dev))
+        control_embeds = control_embeds + self.cem_memory.to(emb_dev, dtype=control_embeds.dtype)
         return control_embeds, control_tokens
 
     def ebm_forward(self, v_embeds, c_embeds):
@@ -425,14 +441,15 @@ class ControlCapT5(Blip2T5):
             )
             inputs_t5 = self.t5_proj(query_output.last_hidden_state)
             atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
-            encoder_atts = torch.cat([atts_t5, control_tokens.attention_mask], dim=1)
+            # Align devices/dtypes before concat when model is sharded across GPUs
+            control_embeds = control_embeds.to(device=inputs_t5.device, dtype=inputs_t5.dtype)
+            control_attn = control_tokens.attention_mask.to(inputs_t5.device)
+            encoder_atts = torch.cat([atts_t5, control_attn], dim=1)
             inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
-
             # If running fp32 LLM mode on GPUs without bf16, keep embeds in fp32 to prevent NaNs
             if (getattr(self, "llm_amp_mode", "auto") in ("fp32", "auto")) and (not torch.cuda.is_bf16_supported()):
                 inputs_embeds = inputs_embeds.float()
-                # control_tokens.attention_mask stays integer; control_embeds already merged
-
+            
             tags = samples["tags"].to(torch.long)
             loss_tag = self.tag_loss_function(tag_logits, tags) * self.tag_weight
 
@@ -519,9 +536,11 @@ class ControlCapT5(Blip2T5):
             )
             inputs_t5 = self.t5_proj(query_output.last_hidden_state)
             atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
-            encoder_atts = torch.cat([atts_t5, control_tokens.attention_mask], dim=1)
+            # Align devices/dtypes before concat when model is sharded across GPUs
+            control_embeds = control_embeds.to(device=inputs_t5.device, dtype=inputs_t5.dtype)
+            control_attn = control_tokens.attention_mask.to(inputs_t5.device)
+            encoder_atts = torch.cat([atts_t5, control_attn], dim=1)
             inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
-
             if (getattr(self, "llm_amp_mode", "auto") in ("fp32", "auto")) and (not torch.cuda.is_bf16_supported()):
                 inputs_embeds = inputs_embeds.float()
 
@@ -579,8 +598,3 @@ class ControlCapT5(Blip2T5):
     @classmethod
     def from_config(cls, cfg):
         return cls(**cfg)
-
-
-
-
-
