@@ -587,7 +587,6 @@ class ControlCapT5(Blip2T5):
 
         output = []
         for id, caption, score, stag, otag in zip(samples["ids"], captions, scores, stags, otags):
-            print(f"ControlCapT5: id={id} score={score:.4f} caption={caption}")
             output.append(
                 {"id": id, "caption": caption, "score": score, "tag_set1": stag, "tag_set2": otag}
             )
