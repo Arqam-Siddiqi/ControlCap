@@ -2,6 +2,8 @@ import math
 import copy
 import random
 import os
+import gc
+import torch.distributed as dist
 from contextlib import nullcontext
 from functools import partial
 
@@ -53,6 +55,8 @@ class CrossAttnBlock(nn.Module):
 class ControlCapT5(Blip2T5):
     def __init__(self, *args, **kwargs):
         self.kwargs = kwargs
+        # Optional memory logging (silent if not requested)
+        self.mem_log = kwargs.get("mem_log", False) or os.environ.get("RUN_MEM_LOG", "0") == "1"
         base_kwargs = copy.deepcopy(kwargs)
         base_kwargs_keys = ["vit_model", "img_size", "drop_path_rate", "use_grad_checkpoint", "vit_precision",
                             "freeze_vit", "num_query_token", "t5_model", "prompt", "max_txt_len", "apply_lemmatizer"]
@@ -67,6 +71,49 @@ class ControlCapT5(Blip2T5):
         self._tag_chunk_logged = False
         # New: length-normalize sequence scores during eval (ranking stability)
         self.length_normalize_scores = kwargs.get("length_normalize_scores", False)
+
+        # Accept both naming styles for quantization flags
+        load_4_bit = kwargs.get("load_in_4bit", kwargs.get("load_4_bit", False))
+        load_8_bit = kwargs.get("load_in_8bit", kwargs.get("load_8_bit", False))
+        if load_4_bit and load_8_bit:
+            raise ValueError("Only one of load_4_bit or load_8_bit can be True.")
+        if load_4_bit or load_8_bit:
+            try:
+                from transformers import AutoModelForSeq2SeqLM, BitsAndBytesConfig
+            except ImportError as e:
+                raise ImportError("transformers with bitsandbytes support is required for quantization.") from e
+            model_id = base_kwargs.get("t5_model", None)
+            if model_id is None:
+                raise ValueError("t5_model must be specified to use quantized loading.")
+            # Avoid automatic multi-GPU sharding inside a single DDP rank to prevent cross-device embedding lookups
+            ddp_active = dist.is_available() and dist.is_initialized()
+            if ddp_active:
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                torch.cuda.set_device(local_rank)
+                device_map = {"": f"cuda:{local_rank}"}
+            else:
+                device_map = "auto"
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=load_4_bit,
+                load_in_8bit=load_8_bit,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+            # Replace full-precision T5 with quantized version
+            del self.t5_model
+            gc.collect()
+            torch.cuda.empty_cache()
+            self.t5_model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_id,
+                quantization_config=bnb_cfg,
+                device_map=device_map,
+            )
+            self._is_quantized = True
+            if self.mem_log:
+                print(f"[INFO] Loaded quantized T5 ({'4-bit' if load_4_bit else '8-bit'}) on {device_map}")
+        else:
+            self._is_quantized = False
 
         # contextual visual embedding module
         input_image_size = self.visual_encoder.image_size
@@ -124,7 +171,9 @@ class ControlCapT5(Blip2T5):
             )
 
             self.t5_model = get_peft_model(self.t5_model, lora_config)
-            self.t5_model.to(torch.float32)
+            # Only upcast if not quantized
+            if not self._is_quantized:
+                self.t5_model.to(torch.float32)
             names.extend(["lora"])
         params = [0] * len(names)
 
@@ -141,7 +190,7 @@ class ControlCapT5(Blip2T5):
                     break
         print(f"[ trainable ratio : {trainable_params / all_params}]")
         for idx, name in enumerate(names):
-            print(f"[{name} ratio : {params[idx] / all_params}")
+            print(f"[{name} ratio : {params[idx] / all_params}]")
 
     def roi_align(self, image_embeds, samples):
         # prepare cls image embeds and spatio image embeddings
@@ -234,8 +283,12 @@ class ControlCapT5(Blip2T5):
             truncation=True,
             max_length=self.max_txt_len,
             return_tensors="pt",
-        ).to(embeds.device)
-        control_embeds = self.t5_model.encoder.embed_tokens(control_tokens.input_ids) + self.cem_memory
+        )
+        # Multi-GPU / possible device_map safety: use actual embedding weight device
+        emb_dev = self.t5_model.encoder.embed_tokens.weight.device
+        control_ids = control_tokens.input_ids.to(emb_dev)
+        control_embeds = self.t5_model.encoder.embed_tokens(control_ids)
+        control_embeds = control_embeds + self.cem_memory.to(emb_dev, dtype=control_embeds.dtype)
         return control_embeds, control_tokens
 
     def ebm_forward(self, v_embeds, c_embeds):
@@ -304,6 +357,100 @@ class ControlCapT5(Blip2T5):
             loss_llm = outputs.loss
 
             return {"loss": loss_llm + loss_tag, "loss_llm": loss_llm.detach(), "loss_tag": loss_tag.detach()}
+
+    def prepare_control_words(self, samples, tag_logits):
+        control_words = []
+        full_drop_ratio = self.kwargs.get("full_drop_ratio", 0.5)
+        drop_ratio = self.kwargs.get("drop_ratio", 0.5)
+        tag_thr = self.kwargs.get("tag_thr", 0.7)
+
+        if self.training:
+            for bz_idx, cap in enumerate(samples["caps"]):
+                try:
+                    s2 = TextBlob(cap).tags
+                    tokens = [el[0] for el in s2]
+                    infowords = [name for name, value in s2 if ("NN" in value) or ("JJ" in value)]
+                    nouns = [name for name, value in s2 if ("NN" in value)]
+                    if len(infowords) > 0:
+                        words = []
+                        for word in infowords:
+                            st_idx = tokens.index(word)
+                            ed_idx = st_idx + 1
+                            while (ed_idx < len(tokens)) and (tokens[ed_idx] in nouns):
+                                ed_idx = ed_idx + 1
+                            word = " ".join(tokens[st_idx:ed_idx])
+                            words.append(word)
+                    else:
+                        words = [""]
+                except:
+                    words = [""]
+                tag_idxs = samples["tags"]
+                stags = [self.tag_list[tag_idx] for tag_idx in torch.nonzero(tag_idxs[bz_idx][:self.num_tags])]
+                otags = [self.tag_list[tag_idx] for tag_idx in torch.nonzero(tag_idxs[bz_idx][self.num_tags:])]
+                tags = stags + otags + words
+                tags = list(set(tags))
+                l = len(tags)
+                if np.random.uniform(0, 1) < full_drop_ratio:
+                    control_word = ""
+                else:
+                    if l == 0:
+                        control_word = ""
+                    else:
+                        sl = torch.from_numpy(np.random.uniform(0, 1, l) > drop_ratio)
+                        control_word = [tags[tag_idx] for tag_idx in torch.nonzero(sl)]
+                        random.shuffle(control_word)
+                        control_word = ",".join(control_word)
+                control_words.append(control_word + "|")
+            return control_words
+        else:
+            tag_scores = tag_logits.sigmoid()
+            tag_idxs = (tag_scores > tag_thr).to(torch.long)
+            stags = [[self.tag_list[tag_idx] for tag_idx in torch.nonzero(tag_idxs[bz_idx][:self.num_tags])]
+                     for bz_idx in range(len(tag_idxs))]
+            otags = [[self.tag_list[tag_idx] for tag_idx in torch.nonzero(tag_idxs[bz_idx][self.num_tags:])]
+                     for bz_idx in range(len(tag_idxs))]
+            tags = [stag + otag for stag, otag in zip(stags, otags)]
+
+            first_word_control = self.kwargs.get("first_word_control", False)
+            if first_word_control:
+                first_words = []
+                for bz_idx, cap in enumerate(samples["caps"]):
+                    try:
+                        s2 = TextBlob(cap).tags
+                        tokens = [el[0] for el in s2]
+                        infowords = [name for name, value in s2 if ("NN" in value) or ("JJ" in value)]
+                        nouns = [name for name, value in s2 if ("NN" in value)]
+                        if len(infowords) > 0:
+                            words = []
+                            for word in infowords:
+                                st_idx = tokens.index(word)
+                                ed_idx = st_idx + 1
+                                while (ed_idx < len(tokens)) and (tokens[ed_idx] in nouns):
+                                    ed_idx = ed_idx + 1
+                                word = " ".join(tokens[st_idx:ed_idx])
+                                words.append(word)
+                        else:
+                            words = []
+                    except:
+                        words = []
+                    if len(words) > 0:
+                        first_word = [words[0]]
+                    else:
+                        first_word = []
+                    first_words.append(first_word)
+                tags = [fword + tag for fword, tag in zip(first_words, tags)]
+
+            controls = samples.get("controls", None)
+            if controls is not None:
+                tags = [control + tag for control, tag in zip(controls, tags)]
+
+            for control_tag in tags:
+                control_tag = list(set(control_tag))
+                # control_tag.sort()
+                control_word = ",".join(control_tag)
+                control_words.append(control_word + "|")
+
+            return control_words, stags, otags
 
     def predict_answers(
             self,
