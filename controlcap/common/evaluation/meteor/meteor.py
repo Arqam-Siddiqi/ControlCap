@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+
 # Python wrapper for METEOR implementation, by Xinlei Chen
 # Acknowledge Michael Denkowski for the generous discussion and help
 from __future__ import division
@@ -10,9 +11,10 @@ import re
 import subprocess
 import sys
 import threading
-import time
+
 import psutil
 
+# Assumes meteor-1.5.jar is in the same directory as meteor.py.  Change as needed.
 METEOR_JAR = 'meteor-1.5.jar'
 
 
@@ -25,148 +27,104 @@ def dec(s):
 
 
 class Meteor:
+
     def __init__(self):
+        # Used to guarantee thread safety
         self.lock = threading.Lock()
-        self.debug = os.environ.get("METEOR_DEBUG", "0") == "1"
 
         mem = '2G'
         mem_available_G = psutil.virtual_memory().available / 1E9
         if mem_available_G < 2:
-            logging.warning("Less than 2GB RAM available, reducing METEOR heap to 1G.")
+            logging.warning("There is less than 2GB of available memory.\n"
+                            "Will try with limiting Meteor to 1GB of memory but this might cause issues.\n"
+                            "If you have problems using Meteor, "
+                            "then you can try to lower the `mem` variable in meteor.py")
             mem = '1G'
 
-        jar_dir = os.path.dirname(os.path.abspath(__file__))
-        jar_path = os.path.join(jar_dir, METEOR_JAR)
-
-        if not os.path.exists(jar_path):
-            raise FileNotFoundError(f"[METEOR] JAR not found at {jar_path}")
-
-        meteor_cmd = [
-            'java',
-            f'-Xmx{mem}',
-            '-jar',
-            METEOR_JAR,
-            '-', '-', '-stdio', '-l', 'en', '-norm'
-        ]
-
+        meteor_cmd = ['java', '-jar', '-Xmx{}'.format(mem), METEOR_JAR,
+                      '-', '-', '-stdio', '-l', 'en', '-norm']
         env = os.environ.copy()
         env['LC_ALL'] = "C"
-
-        self.meteor_p = subprocess.Popen(
-            meteor_cmd,
-            cwd=jar_dir,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-
-        time.sleep(0.2)
-        if self.meteor_p.poll() is not None:
-            stderr_out = self.meteor_p.stderr.read().decode('utf-8', errors='ignore')
-            raise RuntimeError(
-                f"[METEOR] Process exited immediately (code={self.meteor_p.returncode}). "
-                f"stderr:\n{stderr_out}"
-            )
+        self.meteor_p = subprocess.Popen(meteor_cmd,
+                                         cwd=os.path.dirname(os.path.abspath(__file__)),
+                                         env=env,
+                                         stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE)
 
         atexit.register(self.close)
 
     def close(self):
         with self.lock:
-            if getattr(self, "meteor_p", None):
-                try:
-                    if self.meteor_p.stdin:
-                        try:
-                            self.meteor_p.stdin.write(enc('QUIT\n'))
-                            self.meteor_p.stdin.flush()
-                        except Exception:
-                            pass
-                    self.meteor_p.kill()
-                    self.meteor_p.wait(timeout=1)
-                except Exception:
-                    pass
+            if self.meteor_p:
+                self.meteor_p.kill()
+                self.meteor_p.wait()
                 self.meteor_p = None
-        try:
-            if atexit is not None and atexit.unregister is not None:
-                atexit.unregister(self.close)
-        except Exception:
-            pass
+        # if the user calls close() manually, remove the
+        # reference from atexit so the object can be garbage-collected.
+        if atexit is not None and atexit.unregister is not None:
+            atexit.unregister(self.close)
 
     def compute_score(self, gts, res):
-        assert gts.keys() == res.keys()
-        imgIds = list(gts.keys())
+        assert (gts.keys() == res.keys())
+        imgIds = gts.keys()
         scores = []
-        eval_line = 'EVAL'
 
+        eval_line = 'EVAL'
         with self.lock:
             for i in imgIds:
-                assert len(res[i]) == 1
+                assert (len(res[i]) == 1)
                 stat = self._stat(res[i][0], gts[i])
                 eval_line += ' ||| {}'.format(stat)
 
-            try:
-                self._safe_write(eval_line + '\n')
-            except BrokenPipeError as e:
-                self._raise_with_stderr("Broken pipe during EVAL write", e)
-
-            for _ in range(len(imgIds)):
+            self.meteor_p.stdin.write(enc('{}\n'.format(eval_line)))
+            self.meteor_p.stdin.flush()
+            for i in range(0, len(imgIds)):
                 v = self.meteor_p.stdout.readline()
-                if not v:
-                    self._raise_with_stderr("No per-image score line (stdout closed).")
                 try:
                     scores.append(float(dec(v.strip())))
-                except Exception:
-                    sys.stderr.write(f"[METEOR] Bad score line: {v}\n")
-                    self._raise_with_stderr("Failed parsing score line.")
-
-            final_line = self.meteor_p.stdout.readline()
-            if not final_line:
-                self._raise_with_stderr("No final aggregate line (stdout closed).")
-            try:
-                score = float(dec(final_line.strip()))
-            except Exception:
-                self._raise_with_stderr(f"Failed parsing final score line: {final_line!r}")
+                except:
+                    sys.stderr.write("Error handling value: {}\n".format(v))
+                    sys.stderr.write("Decoded value: {}\n".format(dec(v.strip())))
+                    sys.stderr.write("eval_line: {}\n".format(eval_line))
+                    # You can try uncommenting the next code line to show stderr from the Meteor JAR.
+                    # If the Meteor JAR is not writing to stderr, then the line will just hang.
+                    # sys.stderr.write("Error from Meteor:\n{}".format(self.meteor_p.stderr.read()))
+                    raise
+            score = float(dec(self.meteor_p.stdout.readline()).strip())
 
         return score, scores
-
-    def _safe_write(self, line: str):
-        if self.meteor_p.poll() is not None:
-            self._raise_with_stderr("Process already exited before write.")
-        self.meteor_p.stdin.write(enc(line))
-        self.meteor_p.stdin.flush()
-
-    def _raise_with_stderr(self, msg, original_exc=None):
-        rc = self.meteor_p.returncode
-        try:
-            stderr_out = self.meteor_p.stderr.read().decode('utf-8', errors='ignore')
-        except Exception:
-            stderr_out = ""
-        full = (
-            f"[METEOR ERROR] {msg}. returncode={rc}\n"
-            f"--- STDERR ---\n{stderr_out}\n---------------"
-        )
-        if original_exc:
-            raise RuntimeError(full) from original_exc
-        raise RuntimeError(full)
 
     def method(self):
         return "METEOR"
 
     def _stat(self, hypothesis_str, reference_list):
-        hypothesis_str = hypothesis_str.replace('|||', '').strip()
-        reference_list = [r.replace('|||', '').strip() for r in reference_list if r.strip() != ""]
-        if len(reference_list) == 0:
-            return "0 0 0"
+        # SCORE ||| reference 1 words ||| reference n words ||| hypothesis words
+        hypothesis_str = hypothesis_str.replace('|||', '')
         score_line = ' ||| '.join(('SCORE', ' ||| '.join(reference_list), hypothesis_str))
-        score_line = re.sub(r'\\s+', ' ', score_line)
-        try:
-            self._safe_write(f"{score_line}\n")
-        except BrokenPipeError as e:
-            self._raise_with_stderr("Broken pipe during SCORE write", e)
-        out = self.meteor_p.stdout.readline()
-        if not out:
-            self._raise_with_stderr("No SCORE response line (stdout closed).")
-        return dec(out).strip()
+        score_line = re.sub(r'\s+', ' ', score_line)
+        self.meteor_p.stdin.write(enc(score_line))
+        self.meteor_p.stdin.write(enc('\n'))
+        self.meteor_p.stdin.flush()
+        return dec(self.meteor_p.stdout.readline()).strip()
+
+    def _score(self, hypothesis_str, reference_list):
+        with self.lock:
+            # SCORE ||| reference 1 words ||| reference n words ||| hypothesis words
+            hypothesis_str = hypothesis_str.replace('|||', '').replace('  ', ' ')
+            score_line = ' ||| '.join(('SCORE', ' ||| '.join(reference_list), hypothesis_str))
+            self.meteor_p.stdin.write(enc('{}\n'.format(score_line)))
+            self.meteor_p.stdin.flush()
+            stats = dec(self.meteor_p.stdout.readline()).strip()
+            eval_line = 'EVAL ||| {}'.format(stats)
+            # EVAL ||| stats 
+            self.meteor_p.stdin.write(enc('{}\n'.format(eval_line)))
+            self.meteor_p.stdin.flush()
+            score = float(dec(self.meteor_p.stdout.readline()).strip())
+            # bug fix: there are two values returned by the jar file, one average, and one all, so do it twice
+            # thanks for Andrej for pointing this out
+            score = float(dec(self.meteor_p.stdout.readline()).strip())
+        return score
 
     def __del__(self):
         self.close()
