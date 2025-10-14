@@ -393,12 +393,8 @@ class ControlCapTask(BaseTask):
                 elif not isinstance(seg["counts"], bytes):
                     seg["counts"] = seg["counts"].encode()
                 mask = mask_util.decode(seg)
-                x_indices = np.nonzero(mask.sum(0) != 0)[0]
-                y_indices = np.nonzero(mask.sum(1) != 0)[0]
-                if len(x_indices) == 0 or len(y_indices) == 0:
-                    return [0, 0, 0, 0]
-                x1, x2 = x_indices[0], x_indices[-1]
-                y1, y2 = y_indices[0], y_indices[-1]
+                x1, x2 = np.nonzero(mask.sum(0) != 0)[0][0], np.nonzero(mask.sum(0) != 0)[0][-1]  
+                y1, y2 = np.nonzero(mask.sum(1) != 0)[0][0], np.nonzero(mask.sum(1) != 0)[0][-1]
                 bbox = [x1, y1, x2, y2]
             return bbox
 
